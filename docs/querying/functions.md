@@ -11,30 +11,17 @@ instant-vector)`. This means that there is one argument `v` which is an instant
 vector, which if not provided it will default to the value of the expression
 `vector(time())`.
 
-_Notes about the experimental native histograms:_
-
-* Ingesting native histograms has to be enabled via a [feature
-  flag](../feature_flags.md#native-histograms). As long as no native histograms
-  have been ingested into the TSDB, all functions will behave as usual.
-* Functions that do not explicitly mention native histograms in their
-  documentation (see below) will ignore histogram samples.
-* Functions that do already act on native histograms might still change their
-  behavior in the future.
-* If a function requires the same bucket layout between multiple native
-  histograms it acts on, it will automatically convert them
-  appropriately. (With the currently supported bucket schemas, that's always
-  possible.)
-
 ## `abs()`
 
-`abs(v instant-vector)` returns the input vector with all sample values converted to
-their absolute value.
+`abs(v instant-vector)` returns a vector containing all float samples in the
+input vector converted to their absolute value. Histogram samples in the input
+vector are ignored.
 
 ## `absent()`
 
 `absent(v instant-vector)` returns an empty vector if the vector passed to it
-has any elements (floats or native histograms) and a 1-element vector with the
-value 1 if the vector passed to it has no elements.
+has any elements (float samples or histogram samples) and a 1-element vector
+with the value 1 if the vector passed to it has no elements.
 
 This is useful for alerting on when no time series exist for a given metric name
 and label combination.
@@ -56,8 +43,9 @@ of the 1-element output vector from the input vector.
 ## `absent_over_time()`
 
 `absent_over_time(v range-vector)` returns an empty vector if the range vector
-passed to it has any elements (floats or native histograms) and a 1-element
-vector with the value 1 if the range vector passed to it has no elements.
+passed to it has any elements (float samples or histogram samples) and a
+1-element vector with the value 1 if the range vector passed to it has no
+elements.
 
 This is useful for alerting on when no time series exist for a given metric name
 and label combination for a certain amount of time.
@@ -78,8 +66,9 @@ labels of the 1-element output vector from the input vector.
 
 ## `ceil()`
 
-`ceil(v instant-vector)` rounds the sample values of all elements in `v` up to
-the nearest integer value greater than or equal to v.
+`ceil(v instant-vector)` returns a vector containing all float samples in the
+input vector rounded up to the nearest integer value greater than or equal to
+their original value. Histogram samples in the input vector are ignored.
 
 * `ceil(+Inf) = +Inf`
 * `ceil(±0) = ±0`
@@ -90,12 +79,14 @@ the nearest integer value greater than or equal to v.
 
 For each input time series, `changes(v range-vector)` returns the number of
 times its value has changed within the provided time range as an instant
-vector.
+vector. A float sample followed by a histogram sample, or vice versa, counts as
+a change.
 
 ## `clamp()`
 
-`clamp(v instant-vector, min scalar, max scalar)`
-clamps the sample values of all elements in `v` to have a lower limit of `min` and an upper limit of `max`.
+`clamp(v instant-vector, min scalar, max scalar)` clamps the values of all
+float samples in `v` to have a lower limit of `min` and an upper limit of
+`max`. Histogram samples in the input vector are ignored.
 
 Special cases:
 
@@ -104,35 +95,45 @@ Special cases:
 
 ## `clamp_max()`
 
-`clamp_max(v instant-vector, max scalar)` clamps the sample values of all
-elements in `v` to have an upper limit of `max`.
+`clamp_max(v instant-vector, max scalar)` clamps the values of all float
+samples in `v` to have an upper limit of `max`. Histogram samples in the input
+vector are ignored.
 
 ## `clamp_min()`
 
-`clamp_min(v instant-vector, min scalar)` clamps the sample values of all
-elements in `v` to have a lower limit of `min`.
+`clamp_min(v instant-vector, min scalar)` clamps the values of all float
+samples in `v` to have a lower limit of `min`. Histogram samples in the input
+vector are ignored.
 
 ## `day_of_month()`
 
-`day_of_month(v=vector(time()) instant-vector)` returns the day of the month
-for each of the given times in UTC. Returned values are from 1 to 31.
+`day_of_month(v=vector(time()) instant-vector)` interpretes float samples in
+`v` as timestamps (number of seconds since January 1, 1970 UTC) and returns the
+day of the month (in UTC) for each of those timestamps. Returned values are
+from 1 to 31. Histogram samples in the input vector are ignored.
 
 ## `day_of_week()`
 
-`day_of_week(v=vector(time()) instant-vector)` returns the day of the week for
-each of the given times in UTC. Returned values are from 0 to 6, where 0 means
-Sunday etc.
+`day_of_week(v=vector(time()) instant-vector)` interpretes float samples in `v`
+as timestamps (number of seconds since January 1, 1970 UTC) and returns the day
+of the week (in UTC) for each of those timestamps. Returned values are from 0
+to 6, where 0 means Sunday etc. Histogram samples in the input vector are
+ignored.
 
-## `day_of_year()`
+## `day_of_year()` 
 
-`day_of_year(v=vector(time()) instant-vector)` returns the day of the year for
-each of the given times in UTC. Returned values are from 1 to 365 for non-leap years,
-and 1 to 366 in leap years.
+`day_of_year(v=vector(time()) instant-vector)` interpretes float samples in `v`
+as timestamps (number of seconds since January 1, 1970 UTC) and returns the day
+of the year (in UTC) for each of those timestamps. Returned values are from 1
+to 365 for non-leap years, and 1 to 366 in leap years. Histogram samples in the
+input vector are ignored.
 
 ## `days_in_month()`
 
-`days_in_month(v=vector(time()) instant-vector)` returns number of days in the
-month for each of the given times in UTC. Returned values are from 28 to 31.
+`days_in_month(v=vector(time()) instant-vector)` interpretes float samples in
+`v` as timestamps (number of seconds since January 1, 1970 UTC) and returns the
+number of days in the month of each of those timestamps (in UTC). Returned
+values are from 28 to 31. Histogram samples in the input vector are ignored.
 
 ## `delta()`
 
@@ -150,36 +151,67 @@ between now and 2 hours ago:
 delta(cpu_temp_celsius{host="zeus"}[2h])
 ```
 
-`delta` acts on native histograms by calculating a new histogram where each
+`delta` acts on histogram samples by calculating a new histogram where each
 component (sum and count of observations, buckets) is the difference between
-the respective component in the first and last native histogram in
-`v`. However, each element in `v` that contains a mix of float and native
-histogram samples within the range, will be missing from the result vector.
+the respective component in the first and last native histogram in `v`.
+However, each element in `v` that contains a mix of float samples and histogram
+samples within the range will be omitted from the result vector, flagged by a
+warn-level annotation.
 
-`delta` should only be used with gauges and native histograms where the
-components behave like gauges (so-called gauge histograms).
+`delta` should only be used with gauges (for both floats and histograms).
 
 ## `deriv()`
 
-`deriv(v range-vector)` calculates the per-second derivative of the time series in a range
-vector `v`, using [simple linear regression](https://en.wikipedia.org/wiki/Simple_linear_regression).
-The range vector must have at least two samples in order to perform the calculation. When `+Inf` or 
-`-Inf` are found in the range vector, the slope and offset value calculated will be `NaN`.
+`deriv(v range-vector)` calculates the per-second derivative of each float time
+series in the range vector `v`, using [simple linear
+regression](https://en.wikipedia.org/wiki/Simple_linear_regression). The range
+vector must have at least two float samples in order to perform the
+calculation. When `+Inf` or `-Inf` are found in the range vector, the slope and
+offset value calculated will be `NaN`.
 
-`deriv` should only be used with gauges.
+`deriv` should only be used with gauges and only works for float samples.
+Elements in the range vector that contain only histogram samples are ignored
+entirely. For elements that contain a mix of float and histogram samples, only
+the float samples are used as input, which is flagged by an info-level
+annotation.
+
+## `double_exponential_smoothing()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`double_exponential_smoothing(v range-vector, sf scalar, tf scalar)` produces a
+smoothed value for each float time series in the range in `v`. The lower the
+smoothing factor `sf`, the more importance is given to old data. The higher the
+trend factor `tf`, the more trends in the data is considered. Both `sf` and
+`tf` must be between 0 and 1. For additional details, refer to [NIST
+Engineering Statistics
+Handbook](https://www.itl.nist.gov/div898/handbook/pmc/section4/pmc433.htm). In
+Prometheus V2 this function was called `holt_winters`. This caused confusion
+since the Holt-Winters method usually refers to triple exponential smoothing.
+Double exponential smoothing as implemented here is also referred to as "Holt
+Linear".
+
+`double_exponential_smoothing` should only be used with gauges and only works
+for float samples. Elements in the range vector that contain only histogram
+samples are ignored entirely. For elements that contain a mix of float and
+histogram samples, only the float samples are used as input, which is flagged
+by an info-level annotation.
 
 ## `exp()`
 
-`exp(v instant-vector)` calculates the exponential function for all elements in `v`.
-Special cases are:
+`exp(v instant-vector)` calculates the exponential function for all float
+samples in `v`. Histogram samples are ignored. Special cases are:
 
 * `Exp(+Inf) = +Inf`
 * `Exp(NaN) = NaN`
 
 ## `floor()`
 
-`floor(v instant-vector)` rounds the sample values of all elements in `v` down
-to the nearest integer value smaller than or equal to v.
+`floor(v instant-vector)` returns a vector containing all float samples in the
+input vector rounded doewn to the nearest integer value smaller than or equal
+to their original value. Histogram samples in the input vector are ignored.
 
 * `floor(+Inf) = +Inf`
 * `floor(±0) = ±0`
@@ -188,12 +220,8 @@ to the nearest integer value smaller than or equal to v.
 
 ## `histogram_avg()`
 
-_This function only acts on native histograms, which are an experimental
-feature. The behavior of this function may change in future versions of
-Prometheus, including its removal from PromQL._
-
-`histogram_avg(v instant-vector)` returns the arithmetic average of observed values stored in
-a native histogram. Samples that are not native histograms are ignored and do
+`histogram_avg(v instant-vector)` returns the arithmetic average of observed
+values stored in each histogram sample in `v`. Float samples are ignored and do
 not show up in the returned vector.
 
 Use `histogram_avg` as demonstrated below to compute the average request duration
@@ -209,32 +237,25 @@ Which is equivalent to the following query:
 
 ## `histogram_count()` and `histogram_sum()`
 
-_Both functions only act on native histograms, which are an experimental
-feature. The behavior of these functions may change in future versions of
-Prometheus, including their removal from PromQL._
-
 `histogram_count(v instant-vector)` returns the count of observations stored in
-a native histogram. Samples that are not native histograms are ignored and do
-not show up in the returned vector.
+each histogram sample in `v`. Float samples are ignored and do not show up in
+the returned vector.
 
 Similarly, `histogram_sum(v instant-vector)` returns the sum of observations
-stored in a native histogram.
+stored in each histogram sample.
 
 Use `histogram_count` in the following way to calculate a rate of observations
-(in this case corresponding to “requests per second”) from a native histogram:
+(in this case corresponding to “requests per second”) from a series of
+histogram samples:
 
     histogram_count(rate(http_request_duration_seconds[10m]))
 
 ## `histogram_fraction()`
 
-_This function only acts on native histograms, which are an experimental
-feature. The behavior of this function may change in future versions of
-Prometheus, including its removal from PromQL._
-
-For a native histogram, `histogram_fraction(lower scalar, upper scalar, v
-instant-vector)` returns the estimated fraction of observations between the
-provided lower and upper values. Samples that are not native histograms are
-ignored and do not show up in the returned vector.
+`histogram_fraction(lower scalar, upper scalar, v instant-vector)` returns the
+estimated fraction of observations between the provided lower and upper values
+for each histogram sample in `v`. Float samples are ignored and do not show up
+in the returned vector.
 
 For example, the following expression calculates the fraction of HTTP requests
 over the last hour that took 200ms or less:
@@ -253,12 +274,13 @@ observations less than or equal 0.2 would be `-Inf` rather than `0`.
 Whether the provided boundaries are inclusive or exclusive is only relevant if
 the provided boundaries are precisely aligned with bucket boundaries in the
 underlying native histogram. In this case, the behavior depends on the schema
-definition of the histogram. The currently supported schemas all feature
-inclusive upper boundaries and exclusive lower boundaries for positive values
-(and vice versa for negative values). Without a precise alignment of
-boundaries, the function uses linear interpolation to estimate the
-fraction. With the resulting uncertainty, it becomes irrelevant if the
-boundaries are inclusive or exclusive.
+definition of the histogram. (The usual standard exponential schemas all
+feature inclusive upper boundaries and exclusive lower boundaries for positive
+values, and vice versa for negative values.) Without a precise alignment of
+boundaries, the function uses interpolation to estimate the fraction. With the
+resulting uncertainty, it becomes irrelevant if the boundaries are inclusive or
+exclusive. The interpolation method is the same as the one used for
+`histogram_quantile()`. See there for more details.
 
 ## `histogram_quantile()`
 
@@ -270,10 +292,6 @@ summaries](https://prometheus.io/docs/practices/histograms) for a detailed
 explanation of φ-quantiles and the usage of the (classic) histogram metric
 type in general.)
 
-_Note that native histograms are an experimental feature. The behavior of this
-function when dealing with native histograms may change in future versions of
-Prometheus._
-
 The float samples in `b` are considered the counts of observations in each
 bucket of one or more classic histograms. Each float sample must have a label
 `le` where the label value denotes the inclusive upper bound of the bucket.
@@ -284,8 +302,8 @@ type](https://prometheus.io/docs/concepts/metric_types/#histogram)
 automatically provides time series with the `_bucket` suffix and the
 appropriate labels.
 
-The native histogram samples in `b` are treated each individually as a separate
-histogram to calculate the quantile from.
+The (native) histogram samples in `b` are treated each individually as a
+separate histogram to calculate the quantile from.
 
 As long as no naming collisions arise, `b` may contain a mix of classic
 and native histograms.
@@ -336,7 +354,9 @@ non-zero-buckets of native histograms with a standard exponential bucketing
 schema, the interpolation is done under the assumption that the samples within
 the bucket are distributed in a way that they would uniformly populate the
 buckets in a hypothetical histogram with higher resolution. (This is also
-called _exponential interpolation_.)
+called _exponential interpolation_. See the [native histogram
+specification](https://prometheus.io/docs/specs/native_histograms/#interpolation-within-a-bucket)
+for more details.)
 
 If `b` has 0 observations, `NaN` is returned. For φ < 0, `-Inf` is
 returned. For φ > 1, `+Inf` is returned. For φ = `NaN`, `NaN` is returned.
@@ -387,63 +407,46 @@ difference between two buckets is a trillionth (1e-12) of the sum of both
 buckets.) Furthermore, if there are non-monotonic bucket counts even after this
 adjustment, they are increased to the value of the previous buckets to enforce
 monotonicity. The latter is evidence for an actual issue with the input data
-and is therefore flagged with an informational annotation reading `input to
+and is therefore flagged by an info-level annotation reading `input to
 histogram_quantile needed to be fixed for monotonicity`. If you encounter this
 annotation, you should find and remove the source of the invalid data.
 
 ## `histogram_stddev()` and `histogram_stdvar()`
 
-_Both functions only act on native histograms, which are an experimental
-feature. The behavior of these functions may change in future versions of
-Prometheus, including their removal from PromQL._
-
 `histogram_stddev(v instant-vector)` returns the estimated standard deviation
-of observations in a native histogram, based on the geometric mean of the buckets
-where the observations lie. Samples that are not native histograms are ignored and
-do not show up in the returned vector.
+of observations for each histogram sample in `v`, based on the geometric mean
+of the buckets where the observations lie. Float samples are ignored and do not
+show up in the returned vector.
 
 Similarly, `histogram_stdvar(v instant-vector)` returns the estimated standard
-variance of observations in a native histogram.
-
-## `double_exponential_smoothing()`
-
-**This function has to be enabled via the [feature flag](../feature_flags.md#experimental-promql-functions) `--enable-feature=promql-experimental-functions`.**
-
-`double_exponential_smoothing(v range-vector, sf scalar, tf scalar)` produces a smoothed value
-for time series based on the range in `v`. The lower the smoothing factor `sf`,
-the more importance is given to old data. The higher the trend factor `tf`, the
-more trends in the data is considered. Both `sf` and `tf` must be between 0 and
-1.
-For additional details, refer to [NIST Engineering Statistics Handbook](https://www.itl.nist.gov/div898/handbook/pmc/section4/pmc433.htm).
-In Prometheus V2 this function was called `holt_winters`. This caused confusion
-since the Holt-Winters method usually refers to triple exponential smoothing.
-Double exponential smoothing as implemented here is also referred to as "Holt
-Linear".
-
-`double_exponential_smoothing` should only be used with gauges.
+variance of observations for each histogram sample in `v`.
 
 ## `hour()`
 
-`hour(v=vector(time()) instant-vector)` returns the hour of the day
-for each of the given times in UTC. Returned values are from 0 to 23.
+`hour(v=vector(time()) instant-vector)` interpretes float samples in `v` as
+timestamps (number of seconds since January 1, 1970 UTC) and returns the hour
+of the day (in UTC) for each of those timestamps. Returned values are from 0
+to 23. Histogram samples in the input vector are ignored.
 
 ## `idelta()`
 
 `idelta(v range-vector)` calculates the difference between the last two samples
 in the range vector `v`, returning an instant vector with the given deltas and
-equivalent labels.
+equivalent labels. Both samples must be either float samples or histogram
+samples. Elements in `v` where one of the last two samples is a float sample
+and the other is a histogram sample will be omitted from the result vector,
+flagged by a warn-level annotation.
 
-`idelta` should only be used with gauges.
+`idelta` should only be used with gauges (for both floats and histograms).
 
 ## `increase()`
 
-`increase(v range-vector)` calculates the increase in the
-time series in the range vector. Breaks in monotonicity (such as counter
-resets due to target restarts) are automatically adjusted for. The
-increase is extrapolated to cover the full time range as specified
-in the range vector selector, so that it is possible to get a
-non-integer result even if a counter increases only by integer
-increments.
+`increase(v range-vector)` calculates the increase in the time series in the
+range vector. Breaks in monotonicity (such as counter resets due to target
+restarts) are automatically adjusted for. The increase is extrapolated to cover
+the full time range as specified in the range vector selector, so that it is
+possible to get a non-integer result even if a counter increases only by
+integer increments.
 
 The following example expression returns the number of HTTP requests as measured
 over the last 5 minutes, per time series in the range vector:
@@ -452,17 +455,18 @@ over the last 5 minutes, per time series in the range vector:
 increase(http_requests_total{job="api-server"}[5m])
 ```
 
-`increase` acts on native histograms by calculating a new histogram where each
-component (sum and count of observations, buckets) is the increase between
-the respective component in the first and last native histogram in
-`v`. However, each element in `v` that contains a mix of float and native
-histogram samples within the range, will be missing from the result vector.
+`increase` acts on histogram samples by calculating a new histogram where each
+component (sum and count of observations, buckets) is the increase between the
+respective component in the first and last native histogram in `v`. However,
+each element in `v` that contains a mix of float samples and histogram samples
+within the range, will be omitted from the result vector, flagged by a
+warn-level annotation.
 
-`increase` should only be used with counters and native histograms where the
-components behave like counters. It is syntactic sugar for `rate(v)` multiplied
-by the number of seconds under the specified time range window, and should be
-used primarily for human readability.  Use `rate` in recording rules so that
-increases are tracked consistently on a per-second basis.
+`increase` should only be used with counters (for both floats and histograms).
+It is syntactic sugar for `rate(v)` multiplied by the number of seconds under
+the specified time range window, and should be used primarily for human
+readability. Use `rate` in recording rules so that increases are tracked
+consistently on a per-second basis.
 
 ## `info()` (experimental)
 
@@ -560,7 +564,12 @@ consider all matching info series and with their appropriate identifying labels.
 `irate(v range-vector)` calculates the per-second instant rate of increase of
 the time series in the range vector. This is based on the last two data points.
 Breaks in monotonicity (such as counter resets due to target restarts) are
-automatically adjusted for.
+automatically adjusted for. Both samples must be either float samples or
+histogram samples. Elements in `v` where one of the last two samples is a float
+sample and the other is a histogram sample will be omitted from the result
+vector, flagged by a warn-level annotation.
+
+`idelta` should only be used with counters (for both floats and histograms).
 
 The following example expression returns the per-second rate of HTTP requests
 looking up to 5 minutes back for the two most recent data points, per time
@@ -618,8 +627,8 @@ label_replace(up{job="api-server",service="a:c"}, "foo", "$name", "service", "(?
 
 ## `ln()`
 
-`ln(v instant-vector)` calculates the natural logarithm for all elements in `v`.
-Special cases are:
+`ln(v instant-vector)` calculates the natural logarithm for all float samples
+in `v`. Histogram samples in the input vector are ignored. Special cases are:
 
 * `ln(+Inf) = +Inf`
 * `ln(0) = -Inf`
@@ -628,35 +637,47 @@ Special cases are:
 
 ## `log2()`
 
-`log2(v instant-vector)` calculates the binary logarithm for all elements in `v`.
-The special cases are equivalent to those in `ln`.
+`log2(v instant-vector)` calculates the binary logarithm for all float samples
+in `v`. Histogram samples in the input vector are ignored. The special cases
+are equivalent to those in `ln`.
 
 ## `log10()`
 
-`log10(v instant-vector)` calculates the decimal logarithm for all elements in `v`.
-The special cases are equivalent to those in `ln`.
+`log10(v instant-vector)` calculates the decimal logarithm for all float
+samples in `v`. Histogram samples in the input vector are ignored. The special
+cases are equivalent to those in `ln`.
 
 ## `minute()`
 
-`minute(v=vector(time()) instant-vector)` returns the minute of the hour for each
-of the given times in UTC. Returned values are from 0 to 59.
+`minute(v=vector(time()) instant-vector)` interpretes float samples in `v` as
+timestamps (number of seconds since January 1, 1970 UTC) and returns the minute
+of the hour (in UTC) for each of those timestamps. Returned values are from 0
+to 59. Histogram samples in the input vector are ignored.
 
 ## `month()`
 
-`month(v=vector(time()) instant-vector)` returns the month of the year for each
-of the given times in UTC. Returned values are from 1 to 12, where 1 means
-January etc.
+`month(v=vector(time()) instant-vector)` interpretes float samples in `v` as
+timestamps (number of seconds since January 1, 1970 UTC) and returns the month
+of the year (in UTC) for each of those timestamps. Returned values are from 1
+to 12, where 1 means January etc. Histogram samples in the input vector are
+ignored.
 
 ## `predict_linear()`
 
 `predict_linear(v range-vector, t scalar)` predicts the value of time series
 `t` seconds from now, based on the range vector `v`, using [simple linear
-regression](https://en.wikipedia.org/wiki/Simple_linear_regression).
-The range vector must have at least two samples in order to perform the 
-calculation. When `+Inf` or `-Inf` are found in the range vector, 
-the slope and offset value calculated will be `NaN`.
+regression](https://en.wikipedia.org/wiki/Simple_linear_regression). The range
+vector must have at least two float samples in order to perform the
+calculation. When `+Inf` or `-Inf` are found in the range vector, the predicted
+value will be `NaN`.
 
-`predict_linear` should only be used with gauges.
+`predict_linear` should only be used with gauges and only works for float
+samples. Elements in the range vector that contain only histogram samples are
+ignored entirely. For elements that contain a mix of float and histogram
+samples, only the float samples are used as input, which is flagged by an
+info-level annotation.
+
+%%% TODO MARK %%%
 
 ## `rate()`
 
