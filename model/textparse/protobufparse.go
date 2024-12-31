@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"iter"
 	"math"
 	"strconv"
 	"strings"
@@ -56,8 +55,9 @@ var floatFormatBufPool = sync.Pool{
 // the re-arrangement work is actually causing problems (which has to be seen),
 // that expectation needs to be changed.
 type ProtobufParser struct {
-	nextMetricFn func() (*clientpb.DecodedMetric, error, bool)
-	curr         *clientpb.DecodedMetric
+	dec         *clientpb.MetricStreamingDecoder
+	lset        labels.Labels
+	metricBytes *bytes.Buffer
 
 	builder labels.ScratchBuilder // held here to reduce allocations when building Labels
 
@@ -85,12 +85,10 @@ type ProtobufParser struct {
 
 // NewProtobufParser returns a parser for the payload in the byte slice.
 func NewProtobufParser(b []byte, parseClassicHistograms bool, st *labels.SymbolTable) Parser {
-	// TODO(bwplotka) Defer stop to not leak memory, probably require Close()
-	nextMetricFn, _ := iter.Pull2(clientpb.NewMetricDecodingIterator(b))
-
 	return &ProtobufParser{
-		nextMetricFn: nextMetricFn,
-		builder:      labels.NewScratchBuilderWithSymbolTable(st, 16),
+		dec:         clientpb.NewMetricStreamingDecoder(b),
+		metricBytes: &bytes.Buffer{},
+		builder:     labels.NewScratchBuilderWithSymbolTable(st, 16), // TODO(bwplotka): Try base builder.
 
 		state:                  EntryInvalid,
 		parseClassicHistograms: parseClassicHistograms,
@@ -101,18 +99,18 @@ func NewProtobufParser(b []byte, parseClassicHistograms bool, st *labels.SymbolT
 // value, the timestamp if set, and the value of the current sample.
 func (p *ProtobufParser) Series() ([]byte, *int64, float64) {
 	var (
-		ts = &p.curr.TimestampMs // to save allocs, never nil.
+		ts = &p.dec.TimestampMs // to save allocs, never nil.
 		v  float64
 	)
-	switch p.curr.GetType() {
+	switch p.dec.GetType() {
 	case clientpb.MetricType_COUNTER:
-		v = p.curr.GetCounter().GetValue()
+		v = p.dec.GetCounter().GetValue()
 	case clientpb.MetricType_GAUGE:
-		v = p.curr.GetGauge().GetValue()
+		v = p.dec.GetGauge().GetValue()
 	case clientpb.MetricType_UNTYPED:
-		v = p.curr.GetUntyped().GetValue()
+		v = p.dec.GetUntyped().GetValue()
 	case clientpb.MetricType_SUMMARY:
-		s := p.curr.GetSummary()
+		s := p.dec.GetSummary()
 		switch p.fieldPos {
 		case -2:
 			v = float64(s.GetSampleCount())
@@ -127,7 +125,7 @@ func (p *ProtobufParser) Series() ([]byte, *int64, float64) {
 		}
 	case clientpb.MetricType_HISTOGRAM, clientpb.MetricType_GAUGE_HISTOGRAM:
 		// This should only happen for a classic histogram.
-		h := p.curr.GetHistogram()
+		h := p.dec.GetHistogram()
 		switch p.fieldPos {
 		case -2:
 			v = h.GetSampleCountFloat()
@@ -154,7 +152,7 @@ func (p *ProtobufParser) Series() ([]byte, *int64, float64) {
 		panic("encountered unexpected metric type, this is a bug")
 	}
 	if *ts != 0 {
-		return p.curr.MetricBytes(), ts, v
+		return p.metricBytes.Bytes(), ts, v
 	}
 	// TODO(beorn7): We assume here that ts==0 means no timestamp. That's
 	// not true in general, but proto3 originally has no distinction between
@@ -165,7 +163,7 @@ func (p *ProtobufParser) Series() ([]byte, *int64, float64) {
 	// away from gogo-protobuf to an actively maintained protobuf
 	// implementation. Once that's done, we can simply use the `optional`
 	// keyword and check for the unset state explicitly.
-	return p.curr.MetricBytes(), nil, v
+	return p.metricBytes.Bytes(), nil, v
 }
 
 // Histogram returns the bytes of a series with a native histogram as a value,
@@ -180,8 +178,8 @@ func (p *ProtobufParser) Series() ([]byte, *int64, float64) {
 // value.
 func (p *ProtobufParser) Histogram() ([]byte, *int64, *histogram.Histogram, *histogram.FloatHistogram) {
 	var (
-		ts = &p.curr.TimestampMs // to save allocs, never nil.
-		h  = p.curr.GetHistogram()
+		ts = &p.dec.TimestampMs // to save allocs, never nil.
+		h  = p.dec.GetHistogram()
 	)
 
 	if p.parseClassicHistograms && len(h.GetBucket()) > 0 {
@@ -208,17 +206,17 @@ func (p *ProtobufParser) Histogram() ([]byte, *int64, *histogram.Histogram, *his
 			fh.NegativeSpans[i].Offset = span.GetOffset()
 			fh.NegativeSpans[i].Length = span.GetLength()
 		}
-		if p.curr.GetType() == clientpb.MetricType_GAUGE_HISTOGRAM {
+		if p.dec.GetType() == clientpb.MetricType_GAUGE_HISTOGRAM {
 			fh.CounterResetHint = histogram.GaugeType
 		}
 		fh.Compact(0)
 		if *ts != 0 {
-			return p.curr.MetricBytes(), ts, nil, &fh
+			return p.metricBytes.Bytes(), ts, nil, &fh
 		}
 		// Nasty hack: Assume that ts==0 means no timestamp. That's not true in
 		// general, but proto3 has no distinction between unset and
 		// default. Need to avoid in the final format.
-		return p.curr.MetricBytes(), nil, nil, &fh
+		return p.metricBytes.Bytes(), nil, nil, &fh
 	}
 
 	// TODO(bwplotka): Pool those?
@@ -241,29 +239,29 @@ func (p *ProtobufParser) Histogram() ([]byte, *int64, *histogram.Histogram, *his
 		sh.NegativeSpans[i].Offset = span.GetOffset()
 		sh.NegativeSpans[i].Length = span.GetLength()
 	}
-	if p.curr.GetType() == clientpb.MetricType_GAUGE_HISTOGRAM {
+	if p.dec.GetType() == clientpb.MetricType_GAUGE_HISTOGRAM {
 		sh.CounterResetHint = histogram.GaugeType
 	}
 	sh.Compact(0)
 	if *ts != 0 {
-		return p.curr.MetricBytes(), ts, &sh, nil
+		return p.metricBytes.Bytes(), ts, &sh, nil
 	}
-	return p.curr.MetricBytes(), nil, &sh, nil
+	return p.metricBytes.Bytes(), nil, &sh, nil
 }
 
 // Help returns the metric name and help text in the current entry.
 // Must only be called after Next returned a help entry.
 // The returned byte slices become invalid after the next call to Next.
 func (p *ProtobufParser) Help() ([]byte, []byte) {
-	return p.curr.MetricBytes(), []byte(p.curr.GetHelp())
+	return p.metricBytes.Bytes(), []byte(p.dec.GetHelp())
 }
 
 // Type returns the metric name and type in the current entry.
 // Must only be called after Next returned a type entry.
 // The returned byte slices become invalid after the next call to Next.
 func (p *ProtobufParser) Type() ([]byte, model.MetricType) {
-	n := p.curr.MetricBytes()
-	switch p.curr.GetType() {
+	n := p.metricBytes.Bytes()
+	switch p.dec.GetType() {
 	case clientpb.MetricType_COUNTER:
 		return n, model.MetricTypeCounter
 	case clientpb.MetricType_GAUGE:
@@ -282,7 +280,7 @@ func (p *ProtobufParser) Type() ([]byte, model.MetricType) {
 // Must only be called after Next returned a unit entry.
 // The returned byte slices become invalid after the next call to Next.
 func (p *ProtobufParser) Unit() ([]byte, []byte) {
-	return p.curr.MetricBytes(), []byte(p.curr.GetUnit())
+	return p.metricBytes.Bytes(), []byte(p.dec.GetUnit())
 }
 
 // Comment always returns nil because comments aren't supported by the protobuf
@@ -294,22 +292,8 @@ func (p *ProtobufParser) Comment() []byte {
 // Metric writes the labels of the current sample into the passed labels.
 // It returns the string from which the metric was parsed.
 func (p *ProtobufParser) Metric(l *labels.Labels) string {
-	p.builder.Reset()
-	p.builder.Add(labels.MetricName, p.getMagicName())
-
-	if err := p.curr.Label(&p.builder); err != nil {
-		// TODO(bwplotka): handle correctly or move to Next.
-		panic(err)
-	}
-
-	if needed, name, value := p.getMagicLabel(); needed {
-		p.builder.Add(name, value)
-	}
-
-	// Sort labels to maintain the sorted labels invariant.
-	p.builder.Sort()
-	p.builder.Overwrite(l)
-	return yoloString(p.curr.MetricBytes())
+	*l = p.lset.Copy()
+	return yoloString(p.metricBytes.Bytes())
 }
 
 // Exemplar writes the exemplar of the current sample into the passed
@@ -323,13 +307,13 @@ func (p *ProtobufParser) Exemplar(ex *exemplar.Exemplar) bool {
 		return false
 	}
 	var exProto *clientpb.Exemplar
-	switch p.curr.GetType() {
+	switch p.dec.GetType() {
 	case clientpb.MetricType_COUNTER:
-		exProto = p.curr.GetCounter().GetExemplar()
+		exProto = p.dec.GetCounter().GetExemplar()
 	case clientpb.MetricType_HISTOGRAM, clientpb.MetricType_GAUGE_HISTOGRAM:
 		isClassic := p.state == EntrySeries
-		if !isClassic && len(p.curr.GetHistogram().GetExemplars()) > 0 {
-			exs := p.curr.GetHistogram().GetExemplars()
+		if !isClassic && len(p.dec.GetHistogram().GetExemplars()) > 0 {
+			exs := p.dec.GetHistogram().GetExemplars()
 			for p.exemplarPos < len(exs) {
 				exProto = exs[p.exemplarPos]
 				p.exemplarPos++
@@ -341,7 +325,7 @@ func (p *ProtobufParser) Exemplar(ex *exemplar.Exemplar) bool {
 				return false
 			}
 		} else {
-			bb := p.curr.GetHistogram().GetBucket()
+			bb := p.dec.GetHistogram().GetBucket()
 			if p.fieldPos < 0 {
 				if isClassic {
 					return false // At _count or _sum.
@@ -389,13 +373,13 @@ func (p *ProtobufParser) Exemplar(ex *exemplar.Exemplar) bool {
 // invalid (as timestamp e.g. negative value) on counters, summaries or histograms.
 func (p *ProtobufParser) CreatedTimestamp() *int64 {
 	var ct *types.Timestamp
-	switch p.curr.GetType() {
+	switch p.dec.GetType() {
 	case clientpb.MetricType_COUNTER:
-		ct = p.curr.GetCounter().GetCreatedTimestamp()
+		ct = p.dec.GetCounter().GetCreatedTimestamp()
 	case clientpb.MetricType_SUMMARY:
-		ct = p.curr.GetSummary().GetCreatedTimestamp()
+		ct = p.dec.GetSummary().GetCreatedTimestamp()
 	case clientpb.MetricType_HISTOGRAM, clientpb.MetricType_GAUGE_HISTOGRAM:
-		ct = p.curr.GetHistogram().GetCreatedTimestamp()
+		ct = p.dec.GetHistogram().GetCreatedTimestamp()
 	default:
 	}
 	ctAsTime, err := types.TimestampFromProto(ct)
@@ -411,35 +395,33 @@ func (p *ProtobufParser) CreatedTimestamp() *int64 {
 // text format parser). It returns (EntryInvalid, io.EOF) if no samples were
 // read.
 func (p *ProtobufParser) Next() (Entry, error) {
-	var (
-		err error
-		ok  bool
-	)
-
 	p.exemplarReturned = false
 	switch p.state {
 	case EntryInvalid:
 		p.exemplarPos = 0
 		p.fieldPos = -2
 
-		p.curr, err, ok = p.nextMetricFn()
-		if err != nil {
+		if err := p.dec.NextMetricFamily(); err != nil {
 			return p.state, err
 		}
-		if !ok {
-			return p.state, io.EOF
+		if err := p.dec.NextMetric(); err != nil {
+			// Skip empty metric families.
+			if err == io.EOF {
+				return p.Next()
+			}
+			return EntryInvalid, err
 		}
 
 		// We are at the beginning of a metric family. Put only the name
 		// into metricBytes and validate only name, help, and type for now.
-		name := p.curr.GetName()
+		name := p.dec.GetName()
 		if !model.IsValidMetricName(model.LabelValue(name)) {
 			return EntryInvalid, fmt.Errorf("invalid metric name: %s", name)
 		}
-		if help := p.curr.GetHelp(); !utf8.ValidString(help) {
+		if help := p.dec.GetHelp(); !utf8.ValidString(help) {
 			return EntryInvalid, fmt.Errorf("invalid help for metric %q: %s", name, help)
 		}
-		switch p.curr.GetType() {
+		switch p.dec.GetType() {
 		case clientpb.MetricType_COUNTER,
 			clientpb.MetricType_GAUGE,
 			clientpb.MetricType_HISTOGRAM,
@@ -448,11 +430,11 @@ func (p *ProtobufParser) Next() (Entry, error) {
 			clientpb.MetricType_UNTYPED:
 			// All good.
 		default:
-			return EntryInvalid, fmt.Errorf("unknown metric type for metric %q: %s", name, p.curr.GetType())
+			return EntryInvalid, fmt.Errorf("unknown metric type for metric %q: %s", name, p.dec.GetType())
 		}
-		unit := p.curr.GetUnit()
+		unit := p.dec.GetUnit()
 		if len(unit) > 0 {
-			if p.curr.GetType() == clientpb.MetricType_COUNTER && strings.HasSuffix(name, "_total") {
+			if p.dec.GetType() == clientpb.MetricType_COUNTER && strings.HasSuffix(name, "_total") {
 				if !strings.HasSuffix(name[:len(name)-6], unit) || len(name)-6 < len(unit)+1 || name[len(name)-6-len(unit)-1] != '_' {
 					return EntryInvalid, fmt.Errorf("unit %q not a suffix of counter %q", unit, name)
 				}
@@ -460,9 +442,11 @@ func (p *ProtobufParser) Next() (Entry, error) {
 				return EntryInvalid, fmt.Errorf("unit %q not a suffix of metric %q", unit, name)
 			}
 		}
+		p.metricBytes.Reset()
+		p.metricBytes.WriteString(name)
 		p.state = EntryHelp
 	case EntryHelp:
-		if p.curr.Unit != "" {
+		if p.dec.Unit != "" {
 			p.state = EntryUnit
 		} else {
 			p.state = EntryType
@@ -470,27 +454,16 @@ func (p *ProtobufParser) Next() (Entry, error) {
 	case EntryUnit:
 		p.state = EntryType
 	case EntryType:
-		t := p.curr.GetType()
+		t := p.dec.GetType()
 		if (t == clientpb.MetricType_HISTOGRAM || t == clientpb.MetricType_GAUGE_HISTOGRAM) &&
-			isNativeHistogram(p.curr.GetHistogram()) {
+			isNativeHistogram(p.dec.GetHistogram()) {
 			p.state = EntryHistogram
 		} else {
 			p.state = EntrySeries
 		}
-		p.curr, err, ok = p.nextMetricFn()
-		if err != nil {
+		if err := p.updateLsetAndMetricBytes(); err != nil {
 			return EntryInvalid, err
 		}
-		if !ok {
-			return EntryInvalid, io.EOF
-		}
-
-		//if err := p.mf.NextMetric(); err != nil {
-		//	if err == io.EOF {
-		//		return p.Next()
-		//	}
-		//	return EntryInvalid, err
-		//}
 	case EntryHistogram, EntrySeries:
 		if p.redoClassic {
 			p.redoClassic = false
@@ -498,7 +471,8 @@ func (p *ProtobufParser) Next() (Entry, error) {
 			p.fieldPos = -3
 			p.fieldsDone = false
 		}
-		t := p.curr.GetType()
+		t := p.dec.GetType()
+
 		if p.state == EntrySeries && !p.fieldsDone &&
 			(t == clientpb.MetricType_SUMMARY ||
 				t == clientpb.MetricType_HISTOGRAM ||
@@ -513,49 +487,79 @@ func (p *ProtobufParser) Next() (Entry, error) {
 			// histograms after parsing a classic histogram.
 			if p.state == EntrySeries &&
 				(t == clientpb.MetricType_HISTOGRAM || t == clientpb.MetricType_GAUGE_HISTOGRAM) &&
-				isNativeHistogram(p.curr.GetHistogram()) {
+				isNativeHistogram(p.dec.GetHistogram()) {
 				p.state = EntryHistogram
 			}
 		}
-		p.curr, err, ok = p.nextMetricFn()
-		if err != nil {
+		// TODO(bwplotka): Fix case of classic + Native histogram!
+		// if p.metricPos >= len(p.mf.GetMetric()) {			if err := p.dec.NextMetric(); err != nil {
+		//			p.state = EntryInvalid				if err == io.EOF {
+		//			return p.Next()
+		if err := p.dec.NextMetric(); err != nil {
+			if err == io.EOF {
+				p.state = EntryInvalid
+				return p.Next()
+			}
 			return EntryInvalid, err
 		}
-		if !ok {
-			return EntryInvalid, io.EOF
+		if err := p.updateLsetAndMetricBytes(); err != nil {
+			return EntryInvalid, err
 		}
-
-		//if err := p.mf.NextMetric(); err != nil {
-		//	if err == io.EOF {
-		//		p.state = EntryInvalid
-		//		return p.Next()
-		//	}
-		//	return EntryInvalid, err
-		//}
 	default:
 		return EntryInvalid, fmt.Errorf("invalid protobuf parsing state: %d", p.state)
 	}
 	return p.state, nil
 }
 
+func (p *ProtobufParser) updateLsetAndMetricBytes() error {
+	p.builder.Reset()
+	p.builder.Add(labels.MetricName, p.getMagicName())
+
+	if err := p.dec.Label(&p.builder); err != nil {
+		return err
+	}
+
+	if needed, name, value := p.getMagicLabel(); needed {
+		p.builder.Add(name, value)
+	}
+
+	// Sort labels to maintain the sorted labels invariant.
+	p.builder.Sort()
+	p.builder.Overwrite(&p.lset)
+
+	b := p.metricBytes
+	b.Reset()
+	p.lset.Range(func(l labels.Label) {
+		if l.Name == labels.MetricName {
+			b.WriteString(l.Value)
+			return
+		}
+		b.WriteByte(model.SeparatorByte)
+		b.WriteString(l.Name)
+		b.WriteByte(model.SeparatorByte)
+		b.WriteString(l.Value)
+	})
+	return nil
+}
+
 // getMagicName usually just returns p.mf.GetType() but adds a magic suffix
 // ("_count", "_sum", "_bucket") if needed according to the current parser
 // state.
 func (p *ProtobufParser) getMagicName() string {
-	t := p.curr.GetType()
+	t := p.dec.GetType()
 	if p.state == EntryHistogram || (t != clientpb.MetricType_HISTOGRAM && t != clientpb.MetricType_GAUGE_HISTOGRAM && t != clientpb.MetricType_SUMMARY) {
-		return p.curr.GetName()
+		return p.dec.GetName()
 	}
 	if p.fieldPos == -2 {
-		return p.curr.GetName() + "_count"
+		return p.dec.GetName() + "_count"
 	}
 	if p.fieldPos == -1 {
-		return p.curr.GetName() + "_sum"
+		return p.dec.GetName() + "_sum"
 	}
 	if t == clientpb.MetricType_HISTOGRAM || t == clientpb.MetricType_GAUGE_HISTOGRAM {
-		return p.curr.GetName() + "_bucket"
+		return p.dec.GetName() + "_bucket"
 	}
-	return p.curr.GetName()
+	return p.dec.GetName()
 }
 
 // getMagicLabel returns if a magic label ("quantile" or "le") is needed and, if
@@ -564,14 +568,14 @@ func (p *ProtobufParser) getMagicLabel() (bool, string, string) {
 	if p.state == EntryHistogram || p.fieldPos < 0 {
 		return false, "", ""
 	}
-	switch p.curr.GetType() {
+	switch p.dec.GetType() {
 	case clientpb.MetricType_SUMMARY:
-		qq := p.curr.GetSummary().GetQuantile()
+		qq := p.dec.GetSummary().GetQuantile()
 		q := qq[p.fieldPos]
 		p.fieldsDone = p.fieldPos == len(qq)-1
 		return true, model.QuantileLabel, formatOpenMetricsFloat(q.GetQuantile())
 	case clientpb.MetricType_HISTOGRAM, clientpb.MetricType_GAUGE_HISTOGRAM:
-		bb := p.curr.GetHistogram().GetBucket()
+		bb := p.dec.GetHistogram().GetBucket()
 		if p.fieldPos >= len(bb) {
 			p.fieldsDone = true
 			return true, model.BucketLabel, "+Inf"

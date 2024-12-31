@@ -18,54 +18,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"iter"
+	"unicode/utf8"
 	"unsafe"
 
 	proto "github.com/gogo/protobuf/proto"
+	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-// NewMetricDecodingIterator returns Go iterator that unmarshals given protobuf bytes one
-// metric family and metric at the time, allowing efficient streaming.
-//
-// Do not modify DecodedMetric between iterations as it's reused to save allocations.
-// GetGauge, GetCounter, etc are also cached, which means GetGauge will work for counter
-// if previously gauge was parsed. It's up to the caller to use Type to decide what
-// method to use when checking the value.
-//
-// TODO(bwplotka): io.Reader approach is possible too, but textparse has access to whole scrape for now.
-func NewMetricDecodingIterator(data []byte) iter.Seq2[*DecodedMetric, error] {
-	buf := &DecodedMetric{MetricFamily: &MetricFamily{}, Metric: &Metric{}}
-	in := 0
-	return func(yield func(*DecodedMetric, error) bool) {
-		for {
-			n, err := buf.nextMetricFamily(data[in:])
-			if err != nil {
-				if err != io.EOF {
-					yield(nil, err)
-				}
-				return
-			}
-			in += n
-			for {
-				if err := buf.nextMetric(); err != nil {
-					if err == io.EOF {
-						break
-					}
-					yield(nil, err)
-					return
-				}
-				if !yield(buf, nil) {
-					// Asked to be stopped.
-					return
-				}
-			}
-		}
-	}
-}
+type MetricStreamingDecoder struct {
+	in    []byte
+	inPos int
 
-type DecodedMetric struct {
 	// TODO(bwplotka): Switch to generator/plugin that won't have those fields accessible e.g. OpaqueAPI
 	// We leverage the fact those two don't collide.
 	*MetricFamily // Without Metric, guarded by overridden GetMetric method.
@@ -79,32 +44,53 @@ type DecodedMetric struct {
 	labels []chunk
 }
 
+// NewMetricStreamingDecoder returns Go iterator that unmarshals given protobuf bytes one
+// metric family and metric at the time, allowing efficient streaming.
+//
+// Do not modify MetricStreamingDecoder between iterations as it's reused to save allocations.
+// GetGauge, GetCounter, etc are also cached, which means GetGauge will work for counter
+// if previously gauge was parsed. It's up to the caller to use Type to decide what
+// method to use when checking the value.
+//
+// TODO(bwplotka): io.Reader approach is possible too, but textparse has access to whole scrape for now.
+func NewMetricStreamingDecoder(data []byte) *MetricStreamingDecoder {
+	return &MetricStreamingDecoder{
+		in:           data,
+		MetricFamily: &MetricFamily{},
+		Metric:       &Metric{},
+		metrics:      make([]chunk, 0, 100),
+	}
+}
+
 var errInvalidVarint = errors.New("clientpb: invalid varint encountered")
 
-func (m *DecodedMetric) nextMetricFamily(b []byte) (n int, err error) {
+func (m *MetricStreamingDecoder) NextMetricFamily() error {
+	b := m.in[m.inPos:]
 	if len(b) == 0 {
-		return 0, io.EOF
+		return io.EOF
 	}
 	messageLength, varIntLength := proto.DecodeVarint(b) // TODO(bwplotka): Get rid of gogo.
 	if varIntLength == 0 || varIntLength > binary.MaxVarintLen32 {
-		return 0, errInvalidVarint
+		return errInvalidVarint
 	}
 	totalLength := varIntLength + int(messageLength)
 	if totalLength > len(b) {
-		return 0, fmt.Errorf("clientpb: insufficient length of buffer, expected at least %d bytes, got %d bytes", totalLength, len(b))
+		return fmt.Errorf("clientpb: insufficient length of buffer, expected at least %d bytes, got %d bytes", totalLength, len(b))
 	}
 	m.resetMetricFamily()
 	m.mfData = b[varIntLength:totalLength] // TODO: Copy and reuse slice.
-	return totalLength, m.MetricFamily.unmarshalWithoutMetrics(m, m.mfData)
+
+	m.inPos += totalLength
+	return m.MetricFamily.unmarshalWithoutMetrics(m, m.mfData)
 }
 
-func (m *DecodedMetric) resetMetricFamily() {
+func (m *MetricStreamingDecoder) resetMetricFamily() {
 	m.metrics = m.metrics[:0]
 	m.metricIndex = 0
 	m.MetricFamily.Reset()
 }
 
-func (m *DecodedMetric) nextMetric() error {
+func (m *MetricStreamingDecoder) NextMetric() error {
 	if m.metricIndex >= len(m.metrics) {
 		return io.EOF
 	}
@@ -118,8 +104,9 @@ func (m *DecodedMetric) nextMetric() error {
 	return nil
 }
 
-func (m *DecodedMetric) resetMetric() {
+func (m *MetricStreamingDecoder) resetMetric() {
 	m.labels = m.labels[:0]
+	m.TimestampMs = 0
 
 	// TODO(bwplotka): Implement the reuse of complex types?
 	if m.Metric.Histogram != nil {
@@ -130,16 +117,16 @@ func (m *DecodedMetric) resetMetric() {
 	}
 }
 
-func (m *DecodedMetric) GetMetric() {
+func (m *MetricStreamingDecoder) GetMetric() {
 	panic("don't use GetMetric, use Metric directly")
 }
 
-func (m *DecodedMetric) GetLabel() {
+func (m *MetricStreamingDecoder) GetLabel() {
 	panic("don't use GetLabel, use Labels instead")
 }
 
 // Label parses labels into labels scratch builder.
-func (m *DecodedMetric) Label(b *labels.ScratchBuilder) error {
+func (m *MetricStreamingDecoder) Label(b *labels.ScratchBuilder) error {
 	for _, l := range m.labels {
 		if err := parseLabels(m.mData[l.start:l.end], b); err != nil {
 			return err
@@ -148,15 +135,10 @@ func (m *DecodedMetric) Label(b *labels.ScratchBuilder) error {
 	return nil
 }
 
-// MetricBytes returns metric bytes which can be used e.g. as a series cache key.
-func (m *DecodedMetric) MetricBytes() []byte {
-	return m.mData
-}
-
 // parseLabels is essentially LabelPair.Unmarshal but directly adding into scratch builder
 // and reusing strings.
 func parseLabels(dAtA []byte, b *labels.ScratchBuilder) error {
-	var name, value []byte
+	var name, value string
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -215,7 +197,10 @@ func parseLabels(dAtA []byte, b *labels.ScratchBuilder) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			name = dAtA[iNdEx:postIndex]
+			name = yoloString(dAtA[iNdEx:postIndex])
+			if !model.LabelName(name).IsValid() {
+				return fmt.Errorf("invalid label name: %s", name)
+			}
 			iNdEx = postIndex
 		case 2:
 			if wireType != 2 {
@@ -247,7 +232,10 @@ func parseLabels(dAtA []byte, b *labels.ScratchBuilder) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			value = dAtA[iNdEx:postIndex]
+			value = yoloString(dAtA[iNdEx:postIndex])
+			if !utf8.ValidString(value) {
+				return fmt.Errorf("invalid label value: %s", value)
+			}
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -267,8 +255,7 @@ func parseLabels(dAtA []byte, b *labels.ScratchBuilder) error {
 	if iNdEx > l {
 		return io.ErrUnexpectedEOF
 	}
-
-	b.Add(yoloString(name), yoloString(value))
+	b.Add(name, value)
 	return nil
 }
 
@@ -280,7 +267,7 @@ type chunk struct {
 	start, end int
 }
 
-func (m *Metric) unmarshalWithoutLabels(p *DecodedMetric, dAtA []byte) error {
+func (m *Metric) unmarshalWithoutLabels(p *MetricStreamingDecoder, dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -562,7 +549,7 @@ func (m *Metric) unmarshalWithoutLabels(p *DecodedMetric, dAtA []byte) error {
 	return nil
 }
 
-func (m *MetricFamily) unmarshalWithoutMetrics(buf *DecodedMetric, dAtA []byte) error {
+func (m *MetricFamily) unmarshalWithoutMetrics(buf *MetricStreamingDecoder, dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
